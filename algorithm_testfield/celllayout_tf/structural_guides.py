@@ -12,6 +12,7 @@ from math import degrees, hypot
 
 import shapely.affinity as sa
 import shapely.geometry as sg
+from shapely.ops import unary_union
 
 from .schema import ShapeInput, ShapePart
 from .territory import KIND_CURVED, Territory, resolve_territories
@@ -33,6 +34,9 @@ class StructuralGuide:
     event_xs: tuple[float, ...]
     event_ys: tuple[float, ...]
     event_points: tuple[tuple[float, float], ...]
+    guard_xs: tuple[float, ...]
+    guard_ys: tuple[float, ...]
+    guard_points: tuple[tuple[float, float], ...]
 
 
 def build_structural_guides(
@@ -65,6 +69,10 @@ def build_structural_guides(
                 "event_xs": set(),
                 "event_ys": set(),
                 "event_points": set(),
+                "guard_xs": set(),
+                "guard_ys": set(),
+                "guard_points": set(),
+                "straight_polys": [],
             },
         )
 
@@ -79,6 +87,7 @@ def build_structural_guides(
             else:
                 points = _all_ring_points(local_poly)
                 event_points = set()
+                group["straight_polys"].append(local_poly)
 
             for x, y in points:
                 point = (_snap(x), _snap(y))
@@ -90,6 +99,18 @@ def build_structural_guides(
                 group["event_points"].add(point)
                 group["event_xs"].add(point[0])
                 group["event_ys"].add(point[1])
+                group["guard_points"].add(point)
+                group["guard_xs"].add(point[0])
+                group["guard_ys"].add(point[1])
+
+    for group in groups.values():
+        if group["straight_polys"]:
+            for x, y in _reflex_points(unary_union(group["straight_polys"])):
+                point = (_snap(x), _snap(y))
+                if point in group["points"]:
+                    group["guard_points"].add(point)
+                    group["guard_xs"].add(point[0])
+                    group["guard_ys"].add(point[1])
 
     return {
         key: StructuralGuide(
@@ -100,6 +121,9 @@ def build_structural_guides(
             event_xs=tuple(sorted(group["event_xs"])),
             event_ys=tuple(sorted(group["event_ys"])),
             event_points=tuple(sorted(group["event_points"])),
+            guard_xs=tuple(sorted(group["guard_xs"])),
+            guard_ys=tuple(sorted(group["guard_ys"])),
+            guard_points=tuple(sorted(group["guard_points"])),
         )
         for key, group in groups.items()
     }
@@ -142,6 +166,48 @@ def _all_ring_points(poly: sg.Polygon) -> set[tuple[float, float]]:
         for x, y in list(ring.coords)[:-1]:
             out.add((float(x), float(y)))
     return out
+
+
+def _reflex_points(geom) -> set[tuple[float, float]]:
+    out: set[tuple[float, float]] = set()
+    for poly in _polygon_parts(geom):
+        if not poly.exterior.is_ccw:
+            poly = sg.Polygon(
+                list(poly.exterior.coords)[::-1],
+                [list(h.coords)[::-1] for h in poly.interiors],
+            )
+        _scan_reflex_ring(list(poly.exterior.coords)[:-1], out)
+        for hole in poly.interiors:
+            coords = list(hole.coords)[:-1]
+            _scan_reflex_ring(coords[::-1] if hole.is_ccw else coords, out)
+    return out
+
+
+def _scan_reflex_ring(coords, out: set[tuple[float, float]]) -> None:
+    n = len(coords)
+    for i in range(n):
+        ax, ay = coords[(i - 1) % n]
+        bx, by = coords[i]
+        cx, cy = coords[(i + 1) % n]
+        v1x, v1y = bx - ax, by - ay
+        v2x, v2y = cx - bx, cy - by
+        if v1x * v2y - v1y * v2x < -AXIS_TOL:
+            out.add((float(bx), float(by)))
+
+
+def _polygon_parts(geom) -> list[sg.Polygon]:
+    if geom.is_empty:
+        return []
+    if isinstance(geom, sg.Polygon):
+        return [geom]
+    if isinstance(geom, sg.MultiPolygon):
+        return [p for p in geom.geoms if isinstance(p, sg.Polygon) and not p.is_empty]
+    if hasattr(geom, "geoms"):
+        out = []
+        for part in geom.geoms:
+            out.extend(_polygon_parts(part))
+        return out
+    return []
 
 
 def _rotate_geom(geom, theta_rad):

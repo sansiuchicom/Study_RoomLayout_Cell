@@ -1,15 +1,24 @@
 import math
 
+import shapely.affinity as sa
 import shapely.geometry as sg
 from shapely.ops import unary_union
 
 from celllayout_tf.atomize import atomize
 from celllayout_tf.cases import selected_cases
 from celllayout_tf.regionize import Region, regionize
+from celllayout_tf.structural_guides import build_structural_guides
 
 
 def _shape_to_polygon(shape):
     return sg.Polygon(shape.exterior, [list(h) for h in shape.holes])
+
+
+def _local_bounds(shape, theta):
+    poly = _shape_to_polygon(shape)
+    if abs(theta) > 1e-12:
+        poly = sa.rotate(poly, -math.degrees(theta), origin=(0, 0))
+    return poly.bounds
 
 
 def _total_atom_area(atoms):
@@ -48,15 +57,17 @@ def test_regions_dont_span_theta_groups():
         assert len(thetas) == 1, (r.region_id, thetas)
 
 
-def test_axis_aligned_parts_can_share_a_region_in_l_shape():
-    """ㄱ자 has two axis-aligned parts (P0 horizontal, P1 vertical). With
-    cross-piece merging, at least one region should span both parts at the
-    inner corner."""
+def test_axis_aligned_l_shape_respects_inner_corner_guard():
     case = selected_cases([9])[0][2]
     atoms = atomize(case)
     regions = regionize(case, atoms=atoms)
-    spans_two = any(len(r.part_ids) >= 2 for r in regions)
-    assert spans_two, "no region spans both parts in ㄱ자 standard"
+
+    for r in regions:
+        minx, miny, maxx, maxy = _shape_to_polygon(r.shape).bounds
+        if maxx <= 5.0 + 1e-6:
+            assert not (
+                miny < 5.0 < maxy
+            ), (r.region_id, (minx, miny, maxx, maxy))
 
 
 def test_case_13_十_partitions_via_cross_cut_at_reflex():
@@ -99,6 +110,9 @@ def test_cut_history_uses_valid_labels():
     valid_labels = {
         "structural_cross",
         "structural_axis",
+        "guard_cross",
+        "guard_axis",
+        "propagated_axis",
         "cross_cut",
         "vertex_aligned",
         "reflex_pair",
@@ -152,3 +166,34 @@ def test_case_28_regions_respect_y4_structural_seam_in_left_leg():
             assert not (
                 miny < 4.0 < maxy
             ), (r.region_id, (minx, miny, maxx, maxy))
+
+
+def test_case_15_bottom_bar_reuses_horizontal_cut_axis():
+    case = selected_cases([15])[0][2]
+    atoms = atomize(case)
+    regions = regionize(case, atoms=atoms)
+
+    internal_ys = set()
+    for r in regions:
+        minx, miny, maxx, maxy = _shape_to_polygon(r.shape).bounds
+        if miny >= -1e-6 and maxy <= 5.0 + 1e-6:
+            for y in (miny, maxy):
+                if 0.0 + 1e-6 < y < 5.0 - 1e-6:
+                    internal_ys.add(round(y, 2))
+
+    assert len(internal_ys) <= 1, internal_ys
+
+
+def test_case_20_regions_do_not_cross_rotated_reflex_axis():
+    case = selected_cases([20])[0][2]
+    atoms = atomize(case)
+    regions = regionize(case, atoms=atoms)
+    theta = atoms[0].theta
+    guide = build_structural_guides(case)[round(theta, 9)]
+    reflex_y = next(y for y in guide.guard_ys if round(y, 2) == 2.01)
+
+    for r in regions:
+        minx, miny, maxx, maxy = _local_bounds(r.shape, theta)
+        assert not (
+            miny < reflex_y - 1e-6 and reflex_y + 1e-6 < maxy
+        ), (r.region_id, (minx, miny, maxx, maxy))

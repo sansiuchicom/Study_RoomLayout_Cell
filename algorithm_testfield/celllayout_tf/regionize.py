@@ -78,6 +78,16 @@ class _PartitionContext:
     hard_xs: tuple[float, ...]
     hard_ys: tuple[float, ...]
     hard_points: tuple[tuple[float, float], ...]
+    guard_xs: tuple[float, ...]
+    guard_ys: tuple[float, ...]
+    guard_points: tuple[tuple[float, float], ...]
+    axis_ledger: "_AxisLedger"
+
+
+@dataclass
+class _AxisLedger:
+    xs: list[float]
+    ys: list[float]
 
 
 def regionize(
@@ -158,6 +168,21 @@ def regionize(
                 )
                 if guide is not None else ()
             )
+            guard_xs = (
+                tuple(x for x in guide.guard_xs if round(x, 6) in atom_xs_set)
+                if guide is not None else ()
+            )
+            guard_ys = (
+                tuple(y for y in guide.guard_ys if round(y, 6) in atom_ys_set)
+                if guide is not None else ()
+            )
+            guard_points = (
+                tuple(
+                    (x, y) for x, y in guide.guard_points
+                    if round(x, 6) in atom_xs_set and round(y, 6) in atom_ys_set
+                )
+                if guide is not None else ()
+            )
             ctx = _PartitionContext(
                 structural=_structural_coords(local_poly),
                 atom_xs=atom_xs,
@@ -167,6 +192,10 @@ def regionize(
                 hard_xs=hard_xs,
                 hard_ys=hard_ys,
                 hard_points=hard_points,
+                guard_xs=guard_xs,
+                guard_ys=guard_ys,
+                guard_points=guard_points,
+                axis_ledger=_AxisLedger(xs=[], ys=[]),
             )
 
             k = max(1, round(merged_poly.area / target_area))
@@ -236,7 +265,8 @@ def _recurse_partition(local_poly, atoms_with_local, k, ctx):
 
 
 def _recurse_from_cut(sel, atoms_with_local, k, ctx):
-    label, _lines, pieces, _b = sel
+    label, lines, pieces, _b = sel
+    _record_axis_lines(lines, ctx)
     sub_atoms_lists: list[list] = [[] for _ in pieces]
     for aw in atoms_with_local:
         pt = sg.Point(aw[1])
@@ -275,6 +305,9 @@ def _select_cut(local_poly, k_total, ctx):
         ("structural_axis",
          lambda: ([ln] for ln in _structural_axis_lines(local_poly, ctx)),
          False, BAL_MIN, MIN_AREA),
+        ("propagated_axis",
+         lambda: ([ln] for ln in _propagated_axis_lines(local_poly, ctx)),
+         False, BAL_MIN, MIN_AREA),
         ("cross_cut", lambda: _cross_cut_pairs(local_poly, ctx), False, BAL_MIN, MIN_AREA),
         ("vertex_aligned",
          lambda: ([ln] for ln in _vertex_aligned_lines(local_poly, ctx)),
@@ -300,6 +333,15 @@ def _select_feature_cut(local_poly, ctx):
         ("structural_axis",
          lambda: ([ln] for ln in _structural_axis_lines(local_poly, ctx)),
          False),
+        ("guard_cross",
+         lambda: _guard_cross_cut_pairs(local_poly, ctx),
+         False),
+        ("guard_axis",
+         lambda: ([ln] for ln in _guard_axis_lines(local_poly, ctx)),
+         False),
+        ("propagated_axis",
+         lambda: ([ln] for ln in _propagated_axis_lines(local_poly, ctx)),
+         False),
     ):
         cands = ((label, lines) for lines in gen())
         r = _best_cut(
@@ -309,6 +351,7 @@ def _select_feature_cut(local_poly, ctx):
             None,
             prefer_short,
             FEATURE_MIN_AREA,
+            enforce_aspect=False,
         )
         if r is not None:
             return r
@@ -390,6 +433,69 @@ def _structural_cross_cut_pairs(poly, ctx):
             ]
         )
     return pairs
+
+
+def _guard_axis_lines(poly, ctx):
+    minx, miny, maxx, maxy = poly.bounds
+    cuts, sx, sy = [], set(), set()
+    for x in ctx.guard_xs:
+        kx = round(x, 2)
+        if minx + MARGIN < x < maxx - MARGIN and kx not in sx:
+            sx.add(kx)
+            cuts.append(sg.LineString([(x, miny - 1), (x, maxy + 1)]))
+    for y in ctx.guard_ys:
+        ky = round(y, 2)
+        if miny + MARGIN < y < maxy - MARGIN and ky not in sy:
+            sy.add(ky)
+            cuts.append(sg.LineString([(minx - 1, y), (maxx + 1, y)]))
+    return cuts
+
+
+def _guard_cross_cut_pairs(poly, ctx):
+    minx, miny, maxx, maxy = poly.bounds
+    pairs, seen = [], set()
+    for x, y in ctx.guard_points:
+        k = (round(x, 2), round(y, 2))
+        if (
+            k in seen
+            or round(x, 6) not in ctx.atom_xs_set
+            or round(y, 6) not in ctx.atom_ys_set
+            or not (minx + MARGIN < x < maxx - MARGIN)
+            or not (miny + MARGIN < y < maxy - MARGIN)
+        ):
+            continue
+        seen.add(k)
+        pairs.append(
+            [
+                sg.LineString([(x, miny - 1), (x, maxy + 1)]),
+                sg.LineString([(minx - 1, y), (maxx + 1, y)]),
+            ]
+        )
+    return pairs
+
+
+def _propagated_axis_lines(poly, ctx):
+    minx, miny, maxx, maxy = poly.bounds
+    cuts, sx, sy = [], set(), set()
+    for x in ctx.axis_ledger.xs:
+        kx = round(x, 2)
+        if (
+            round(x, 6) in ctx.atom_xs_set
+            and minx + MARGIN < x < maxx - MARGIN
+            and kx not in sx
+        ):
+            sx.add(kx)
+            cuts.append(sg.LineString([(x, miny - 1), (x, maxy + 1)]))
+    for y in ctx.axis_ledger.ys:
+        ky = round(y, 2)
+        if (
+            round(y, 6) in ctx.atom_ys_set
+            and miny + MARGIN < y < maxy - MARGIN
+            and ky not in sy
+        ):
+            sy.add(ky)
+            cuts.append(sg.LineString([(minx - 1, y), (maxx + 1, y)]))
+    return cuts
 
 
 def _vertex_aligned_lines(poly, ctx):
@@ -549,6 +655,7 @@ def _best_cut(
     k_total,
     prefer_short=False,
     min_area=MIN_AREA,
+    enforce_aspect=True,
 ):
     valid = []
     for label, lines in candidates:
@@ -556,7 +663,9 @@ def _best_cut(
         if pieces is None or min(p.area for p in pieces) < min_area:
             continue
         b = _balance(pieces)
-        if b < bal_min or not _aspect_ok(pieces, k_total):
+        if b < bal_min:
+            continue
+        if enforce_aspect and not _aspect_ok(pieces, k_total):
             continue
         valid.append((label, lines, pieces, b))
     if not valid:
@@ -576,6 +685,25 @@ def _best_cut(
             )
         )
     return valid[0]
+
+
+def _record_axis_lines(lines, ctx):
+    for line in lines:
+        coords = list(line.coords)
+        if len(coords) < 2:
+            continue
+        x0, y0 = coords[0]
+        x1, y1 = coords[-1]
+        if abs(x0 - x1) < 1e-6:
+            _append_unique_axis(ctx.axis_ledger.xs, x0)
+        elif abs(y0 - y1) < 1e-6:
+            _append_unique_axis(ctx.axis_ledger.ys, y0)
+
+
+def _append_unique_axis(values: list[float], value: float) -> None:
+    value = round(float(value), 6)
+    if all(abs(existing - value) > 1e-6 for existing in values):
+        values.append(value)
 
 
 # Geometry helpers ------------------------------------------------------------
