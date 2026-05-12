@@ -25,6 +25,7 @@ from shapely.strtree import STRtree
 
 from .dimensions import DimensionPolicy, snap_length, split_interval
 from .schema import ShapeInput, ShapePart
+from .structural_guides import build_structural_guides
 from .territory import KIND_CURVED, resolve_territories
 
 
@@ -62,6 +63,7 @@ def atomize(
     """
     policy = policy or DimensionPolicy()
     territories = resolve_territories(shape)
+    structural_guides = build_structural_guides(shape, territories)
 
     # Group pieces by their effective theta (curved is treated as 0).
     groups: dict[float, list[tuple]] = defaultdict(list)
@@ -74,7 +76,7 @@ def atomize(
 
     atoms: list[Atom] = []
     next_id = [0]
-    for members in groups.values():
+    for key, members in groups.items():
         if not members:
             continue
         eff_theta = members[0][0]
@@ -101,6 +103,10 @@ def atomize(
             xs, ys = _piece_anchors(local_poly, is_curved)
             all_xs.update(xs)
             all_ys.update(ys)
+        guide = structural_guides.get(key)
+        if guide is not None:
+            all_xs.update(guide.xs)
+            all_ys.update(guide.ys)
         if not all_xs or not all_ys:
             continue
 

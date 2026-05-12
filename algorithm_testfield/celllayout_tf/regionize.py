@@ -1,24 +1,29 @@
-"""Atom-based regionizer.
+"""Atom-based regionizer with cross-piece merging.
 
-Cut selection follows the reference algorithm at
-``algorithm/celllayout/zoning.py``: hierarchical priority T1a → T1b → T2 → T3,
-deterministic with balance/aspect gates and no scoring function.
+Algorithm:
 
-Two adaptations for atom alignment (because our region geometry is the union
-of constituent atom polygons, not the polygon-cut sub-piece):
+1. Group atoms by effective theta (curved → 0, otherwise atom.theta).
+2. Within each theta group, find connected components via the atom graph
+   (cross-piece edges merge axis-aligned parts that share a boundary).
+3. For each component, union atom polygons into one merged piece.
+4. Apply hierarchical polygon-cut partition on the merged piece. Cut
+   candidates are filtered so they align with atom column/row positions,
+   mirroring the reference algorithm but ensuring every cut coincides with
+   atom edges (no thin region-boundary slivers).
+5. Assign atoms to leaf sub-pieces by local-frame centroid containment.
 
-1. Cut candidate vertices are taken from the raw piece polygon (no
-   simplification). Atom anchors already include every raw polygon vertex,
-   so T1a/T1b cut lines coincide with atom column/row boundaries.
+The merging step is what makes region boundaries line up across the (formerly
+independent) part-piece boundaries — analogous to the atom-phase fix where
+same-theta pieces shared anchors.
 
-2. T3 ``axis_mid`` candidates are sampled from the local-frame atom edge
-   positions inside the [0.3, 0.7] bbox fraction range — not from evenly
-   spaced fractions — so T3 cuts also align with atom edges.
-
-Atoms are assigned to sub-pieces by local-frame centroid containment. The
-resulting region polygon is the union of the assigned atom polygons in the
-global frame, so the region boundary follows atom edges everywhere except
-where a T2 (oblique reflex_pair) cut runs through atom interiors.
+Cut hierarchy (from reference at algorithm/celllayout/zoning.py):
+    T1a cross_cut       — V + H at a polygon vertex (atom-aligned)
+    T1b vertex_aligned  — V or H at a polygon vertex (atom-aligned axis)
+    T2  reflex_pair     — oblique line between two reflex vertices (atom
+                          alignment not possible; region boundary follows
+                          atom edges via centroid assignment)
+    T3  axis_mid        — V or H at an atom anchor inside [0.3, 0.7] bbox
+                          fraction (atom-aligned)
 """
 
 from __future__ import annotations
@@ -33,19 +38,23 @@ import shapely.geometry as sg
 from shapely.geometry.polygon import orient as _orient
 from shapely.ops import split, unary_union
 
+from .atom_graph import AtomGraph, build_atom_graph
 from .atomize import Atom, atomize
 from .dimensions import DimensionPolicy
 from .schema import ShapeInput, ShapePart
+from .structural_guides import build_structural_guides
 from .territory import KIND_CURVED, resolve_territories
 
 
 # Reference parameters --------------------------------------------------------
-MIN_AREA = 3.0          # m² minimum final region area
-MARGIN = 0.5            # m vertex too close to bbox edge is skipped
-MIN_CUT_LEN = 1.0       # m oblique reflex-pair line minimum internal length
-MAX_ASPECT = 4.0        # final region MRR aspect cap
-BAL_MIN = 0.15          # T1/T2 balance threshold (small piece ≥ 14% of large)
-TIE_DECIMALS = 6        # balance tie-break precision (float drift tolerance)
+MIN_AREA = 3.0
+FEATURE_MIN_AREA = 0.5
+MARGIN = 0.5
+MIN_CUT_LEN = 1.0
+MAX_ASPECT = 4.0
+BAL_MIN = 0.15
+FEATURE_BAL_MIN = 0.0
+TIE_DECIMALS = 6
 
 
 @dataclass(frozen=True)
@@ -53,8 +62,8 @@ class Region:
     region_id: int
     shape: ShapePart
     atom_ids: tuple[int, ...]
-    part_id: int
-    piece_id: int
+    part_ids: tuple[int, ...]
+    piece_keys: tuple[tuple[int, int], ...]
     theta: float
     cut_history: tuple[str, ...]
 
@@ -64,11 +73,17 @@ class _PartitionContext:
     structural: dict
     atom_xs: tuple[float, ...]
     atom_ys: tuple[float, ...]
+    atom_xs_set: frozenset[float]
+    atom_ys_set: frozenset[float]
+    hard_xs: tuple[float, ...]
+    hard_ys: tuple[float, ...]
+    hard_points: tuple[tuple[float, float], ...]
 
 
 def regionize(
     shape: ShapeInput,
     atoms: tuple[Atom, ...] | None = None,
+    atom_graph: AtomGraph | None = None,
     policy: DimensionPolicy | None = None,
     *,
     target_area: float = 6.0,
@@ -77,37 +92,84 @@ def regionize(
         atoms = atomize(shape, policy)
     if not atoms:
         return ()
+    atoms_list = list(atoms)
+    if atom_graph is None:
+        atom_graph = build_atom_graph(shape, atoms=tuple(atoms_list))
 
     territories = resolve_territories(shape)
-    atoms_by_pp: dict[tuple[int, int], list[Atom]] = defaultdict(list)
-    for a in atoms:
-        atoms_by_pp[(a.part_id, a.piece_id)].append(a)
+    structural_guides = build_structural_guides(shape, territories)
+    terr_by_part = {t.part_id: t for t in territories}
+
+    def _eff_theta(atom: Atom) -> float:
+        terr = terr_by_part.get(atom.part_id)
+        is_curved = (terr.kind == KIND_CURVED) if terr else False
+        return 0.0 if is_curved else atom.theta
+
+    # Group atom indices by effective theta
+    theta_groups: dict[float, list[int]] = defaultdict(list)
+    for idx, a in enumerate(atoms_list):
+        key = round(_eff_theta(a), 9)
+        theta_groups[key].append(idx)
+
+    # Build adjacency by atom INDEX (matches atom_graph edge encoding)
+    adjacency: dict[int, list[int]] = defaultdict(list)
+    for e in atom_graph.edges:
+        adjacency[e.atom_a].append(e.atom_b)
+        adjacency[e.atom_b].append(e.atom_a)
 
     regions: list[Region] = []
     next_id = [0]
 
-    for terr in territories:
-        eff_theta = 0.0 if terr.kind == KIND_CURVED else terr.theta
-        for piece_idx, piece in enumerate(terr.pieces):
-            piece_poly = _to_shapely(piece)
-            piece_atoms = atoms_by_pp.get((terr.part_id, piece_idx), [])
-            if piece_poly.area < 1e-9 or not piece_atoms:
+    for group_indices in theta_groups.values():
+        group_set = set(group_indices)
+        for comp_indices in _components_within(group_set, adjacency):
+            comp_atoms = [atoms_list[i] for i in comp_indices]
+            atom_polys = [_to_shapely(a.shape) for a in comp_atoms]
+            merged_poly = unary_union(atom_polys)
+            if isinstance(merged_poly, sg.MultiPolygon):
+                merged_poly = max(merged_poly.geoms, key=lambda p: p.area)
+            if not isinstance(merged_poly, sg.Polygon) or merged_poly.area < 1e-9:
                 continue
 
-            local_poly = _rotate_geom(piece_poly, -eff_theta)
+            eff_theta = _eff_theta(comp_atoms[0])
+            local_poly = _rotate_geom(merged_poly, -eff_theta)
             atoms_with_local = [
-                (a, _rotate_point(a.centroid, -eff_theta)) for a in piece_atoms
+                (a, _rotate_point(a.centroid, -eff_theta)) for a in comp_atoms
             ]
-            local_atom_polys = [
-                _rotate_geom(_to_shapely(a.shape), -eff_theta) for a in piece_atoms
-            ]
+            local_atom_polys = [_rotate_geom(p, -eff_theta) for p in atom_polys]
+
+            atom_xs = _collect_atom_edge_positions(local_atom_polys, axis="x")
+            atom_ys = _collect_atom_edge_positions(local_atom_polys, axis="y")
+            atom_xs_set = frozenset(round(x, 6) for x in atom_xs)
+            atom_ys_set = frozenset(round(y, 6) for y in atom_ys)
+            guide = structural_guides.get(round(eff_theta, 9))
+            hard_xs = (
+                tuple(x for x in guide.event_xs if round(x, 6) in atom_xs_set)
+                if guide is not None else ()
+            )
+            hard_ys = (
+                tuple(y for y in guide.event_ys if round(y, 6) in atom_ys_set)
+                if guide is not None else ()
+            )
+            hard_points = (
+                tuple(
+                    (x, y) for x, y in guide.event_points
+                    if round(x, 6) in atom_xs_set and round(y, 6) in atom_ys_set
+                )
+                if guide is not None else ()
+            )
             ctx = _PartitionContext(
                 structural=_structural_coords(local_poly),
-                atom_xs=_collect_atom_edge_positions(local_atom_polys, axis="x"),
-                atom_ys=_collect_atom_edge_positions(local_atom_polys, axis="y"),
+                atom_xs=atom_xs,
+                atom_ys=atom_ys,
+                atom_xs_set=atom_xs_set,
+                atom_ys_set=atom_ys_set,
+                hard_xs=hard_xs,
+                hard_ys=hard_ys,
+                hard_points=hard_points,
             )
 
-            k = max(1, round(piece_poly.area / target_area))
+            k = max(1, round(merged_poly.area / target_area))
             groups = _recurse_partition(local_poly, atoms_with_local, k, ctx)
 
             for atom_list, cut_history in groups:
@@ -117,13 +179,17 @@ def regionize(
                 shape_part = _union_atoms_to_shape_part(actual_atoms)
                 if shape_part is None:
                     continue
+                part_ids = tuple(sorted({a.part_id for a in actual_atoms}))
+                piece_keys = tuple(sorted(
+                    {(a.part_id, a.piece_id) for a in actual_atoms}
+                ))
                 regions.append(
                     Region(
                         region_id=next_id[0],
                         shape=shape_part,
                         atom_ids=tuple(a.atom_id for a in actual_atoms),
-                        part_id=terr.part_id,
-                        piece_id=piece_idx,
+                        part_ids=part_ids,
+                        piece_keys=piece_keys,
                         theta=eff_theta,
                         cut_history=tuple(cut_history),
                     )
@@ -133,17 +199,43 @@ def regionize(
     return tuple(regions)
 
 
+def _components_within(group_set, adjacency):
+    unvisited = set(group_set)
+    components = []
+    while unvisited:
+        start = next(iter(unvisited))
+        stack = [start]
+        comp = []
+        unvisited.discard(start)
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for nb in adjacency.get(node, ()):
+                if nb in unvisited:
+                    unvisited.discard(nb)
+                    stack.append(nb)
+        components.append(comp)
+    return components
+
+
 # Recursive partition ---------------------------------------------------------
 
 
 def _recurse_partition(local_poly, atoms_with_local, k, ctx):
     if k <= 1 or local_poly.area < MIN_AREA * 2:
+        sel = _select_feature_cut(local_poly, ctx)
+        if sel is not None:
+            return _recurse_from_cut(sel, atoms_with_local, max(k, 1), ctx)
         return [(atoms_with_local, [])]
 
     sel = _select_cut(local_poly, k, ctx)
     if sel is None:
         return [(atoms_with_local, [])]
 
+    return _recurse_from_cut(sel, atoms_with_local, k, ctx)
+
+
+def _recurse_from_cut(sel, atoms_with_local, k, ctx):
     label, _lines, pieces, _b = sel
     sub_atoms_lists: list[list] = [[] for _ in pieces]
     for aw in atoms_with_local:
@@ -172,21 +264,52 @@ def _recurse_partition(local_poly, atoms_with_local, k, ctx):
     return result
 
 
-# Cut selection (mirrors reference) ------------------------------------------
+# Cut selection ---------------------------------------------------------------
 
 
 def _select_cut(local_poly, k_total, ctx):
-    for label, gen, prefer_short, bmin in (
-        ("cross_cut", lambda: _cross_cut_pairs(local_poly), False, BAL_MIN),
-        ("vertex_aligned", lambda: ([ln] for ln in
-                                     _vertex_aligned_lines(local_poly, ctx.structural)),
-                                                                 False, BAL_MIN),
-        ("reflex_pair", lambda: _reflex_pair_lines(local_poly), True, BAL_MIN),
-        ("axis_mid", lambda: _axis_mid_lines_atom_aligned(local_poly, ctx),
-                                                                 False, 0.0),
+    for label, gen, prefer_short, bmin, min_area in (
+        ("structural_cross",
+         lambda: _structural_cross_cut_pairs(local_poly, ctx),
+         False, BAL_MIN, MIN_AREA),
+        ("structural_axis",
+         lambda: ([ln] for ln in _structural_axis_lines(local_poly, ctx)),
+         False, BAL_MIN, MIN_AREA),
+        ("cross_cut", lambda: _cross_cut_pairs(local_poly, ctx), False, BAL_MIN, MIN_AREA),
+        ("vertex_aligned",
+         lambda: ([ln] for ln in _vertex_aligned_lines(local_poly, ctx)),
+         False, BAL_MIN, MIN_AREA),
+        ("reflex_pair", lambda: _reflex_pair_lines(local_poly), True, BAL_MIN, MIN_AREA),
+        ("axis_mid",
+         lambda: _axis_mid_lines_atom_aligned(local_poly, ctx),
+         False, 0.0, MIN_AREA),
     ):
         cands = ((label, lines) for lines in gen())
-        r = _best_cut(cands, local_poly, bmin, k_total, prefer_short)
+        r = _best_cut(cands, local_poly, bmin, k_total, prefer_short, min_area)
+        if r is not None:
+            return r
+    return None
+
+
+def _select_feature_cut(local_poly, ctx):
+    """Try hard structural cuts even when target-area recursion has stopped."""
+    for label, gen, prefer_short in (
+        ("structural_cross",
+         lambda: _structural_cross_cut_pairs(local_poly, ctx),
+         False),
+        ("structural_axis",
+         lambda: ([ln] for ln in _structural_axis_lines(local_poly, ctx)),
+         False),
+    ):
+        cands = ((label, lines) for lines in gen())
+        r = _best_cut(
+            cands,
+            local_poly,
+            FEATURE_BAL_MIN,
+            None,
+            prefer_short,
+            FEATURE_MIN_AREA,
+        )
         if r is not None:
             return r
     return None
@@ -230,28 +353,82 @@ def _structural_coords(poly):
     }
 
 
-def _vertex_aligned_lines(poly, structural=None):
+def _structural_axis_lines(poly, ctx):
     minx, miny, maxx, maxy = poly.bounds
-    coords = _vertex_coords_raw(poly)
-    if structural:
-        coords += [(x, miny) for x in structural["xs"]]
-        coords += [(minx, y) for y in structural["ys"]]
     cuts, sx, sy = [], set(), set()
-    for x, y in coords:
-        kx, ky = round(x, 2), round(y, 2)
+    for x in ctx.hard_xs:
+        kx = round(x, 2)
         if minx + MARGIN < x < maxx - MARGIN and kx not in sx:
             sx.add(kx)
             cuts.append(sg.LineString([(x, miny - 1), (x, maxy + 1)]))
+    for y in ctx.hard_ys:
+        ky = round(y, 2)
         if miny + MARGIN < y < maxy - MARGIN and ky not in sy:
             sy.add(ky)
             cuts.append(sg.LineString([(minx - 1, y), (maxx + 1, y)]))
     return cuts
 
 
-def _cross_cut_pairs(poly):
+def _structural_cross_cut_pairs(poly, ctx):
+    minx, miny, maxx, maxy = poly.bounds
+    pairs, seen = [], set()
+    for x, y in ctx.hard_points:
+        k = (round(x, 2), round(y, 2))
+        if (
+            k in seen
+            or round(x, 6) not in ctx.atom_xs_set
+            or round(y, 6) not in ctx.atom_ys_set
+            or not (minx + MARGIN < x < maxx - MARGIN)
+            or not (miny + MARGIN < y < maxy - MARGIN)
+        ):
+            continue
+        seen.add(k)
+        pairs.append(
+            [
+                sg.LineString([(x, miny - 1), (x, maxy + 1)]),
+                sg.LineString([(minx - 1, y), (maxx + 1, y)]),
+            ]
+        )
+    return pairs
+
+
+def _vertex_aligned_lines(poly, ctx):
+    """T1b: V/H per polygon vertex, restricted to atom-anchor positions.
+
+    Parent reflex coords carried via ``ctx.structural`` are also tried, but
+    only if they appear in the atom anchor set (typically true for axis-
+    aligned shapes since atom anchors include every polygon vertex).
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    coords = _vertex_coords_raw(poly)
+    if ctx.structural:
+        coords += [(x, miny) for x in ctx.structural["xs"]]
+        coords += [(minx, y) for y in ctx.structural["ys"]]
+
+    cuts, sx, sy = [], set(), set()
+    for x, y in coords:
+        kx, ky = round(x, 2), round(y, 2)
+        x_aligned = round(x, 6) in ctx.atom_xs_set
+        y_aligned = round(y, 6) in ctx.atom_ys_set
+        if x_aligned and minx + MARGIN < x < maxx - MARGIN and kx not in sx:
+            sx.add(kx)
+            cuts.append(sg.LineString([(x, miny - 1), (x, maxy + 1)]))
+        if y_aligned and miny + MARGIN < y < maxy - MARGIN and ky not in sy:
+            sy.add(ky)
+            cuts.append(sg.LineString([(minx - 1, y), (maxx + 1, y)]))
+    return cuts
+
+
+def _cross_cut_pairs(poly, ctx):
+    """T1a: V+H pair per polygon vertex, both axes must align with atom anchors."""
     minx, miny, maxx, maxy = poly.bounds
     pairs, seen = [], set()
     for x, y in _vertex_coords_raw(poly):
+        if (
+            round(x, 6) not in ctx.atom_xs_set
+            or round(y, 6) not in ctx.atom_ys_set
+        ):
+            continue
         k = (round(x, 2), round(y, 2))
         if (
             k in seen
@@ -286,7 +463,6 @@ def _reflex_pair_lines(poly):
 
 
 def _axis_mid_lines_atom_aligned(poly, ctx):
-    """T3 fallback at atom-aligned positions inside [0.3, 0.7] bbox fraction."""
     minx, miny, maxx, maxy = poly.bounds
     W = maxx - minx
     H = maxy - miny
@@ -366,11 +542,18 @@ def _aspect_ok(pieces, k_total):
     return True
 
 
-def _best_cut(candidates, poly, bal_min, k_total, prefer_short=False):
+def _best_cut(
+    candidates,
+    poly,
+    bal_min,
+    k_total,
+    prefer_short=False,
+    min_area=MIN_AREA,
+):
     valid = []
     for label, lines in candidates:
         pieces = _split_pieces(poly, lines)
-        if pieces is None or min(p.area for p in pieces) < MIN_AREA:
+        if pieces is None or min(p.area for p in pieces) < min_area:
             continue
         b = _balance(pieces)
         if b < bal_min or not _aspect_ok(pieces, k_total):

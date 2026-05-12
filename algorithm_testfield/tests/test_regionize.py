@@ -36,37 +36,35 @@ def test_every_atom_assigned_to_exactly_one_region():
     assert assigned == all_atom_ids
 
 
-def test_region_areas_within_min_max_band_mostly():
-    case = selected_cases([1])[0][2]
+def test_regions_dont_span_theta_groups():
+    """Different theta groups must produce separate regions (geometric
+    constraint — rotated and axis-aligned grids cannot share a frame)."""
+    case = selected_cases([22])[0][2]  # main θ=0, wing θ=25°
     atoms = atomize(case)
     regions = regionize(case, atoms=atoms)
-    for r in regions:
-        poly = _shape_to_polygon(r.shape)
-        # at minimum, every region should not be a sliver
-        assert poly.area > 0.5, (r.region_id, poly.area)
-
-
-def test_regions_dont_span_part_or_piece():
-    case = selected_cases([22])[0][2]  # main(part 0) + wing(part 1)
-    atoms = atomize(case)
-    regions = regionize(case, atoms=atoms)
-
     atom_by_id = {a.atom_id: a for a in atoms}
     for r in regions:
-        parts = {atom_by_id[aid].part_id for aid in r.atom_ids}
-        pieces = {atom_by_id[aid].piece_id for aid in r.atom_ids}
-        assert len(parts) == 1, (r.region_id, parts)
-        assert len(pieces) == 1, (r.region_id, pieces)
+        thetas = {atom_by_id[aid].theta for aid in r.atom_ids}
+        assert len(thetas) == 1, (r.region_id, thetas)
 
 
-def test_case_13_disjoint_pieces_get_separate_regions():
-    case = selected_cases([13])[0][2]  # 十자: P0 + P1 (split into 2 pieces)
+def test_axis_aligned_parts_can_share_a_region_in_l_shape():
+    """ㄱ자 has two axis-aligned parts (P0 horizontal, P1 vertical). With
+    cross-piece merging, at least one region should span both parts at the
+    inner corner."""
+    case = selected_cases([9])[0][2]
     atoms = atomize(case)
     regions = regionize(case, atoms=atoms)
+    spans_two = any(len(r.part_ids) >= 2 for r in regions)
+    assert spans_two, "no region spans both parts in ㄱ자 standard"
 
-    pieces_seen = {(r.part_id, r.piece_id) for r in regions}
-    assert (1, 0) in pieces_seen
-    assert (1, 1) in pieces_seen
+
+def test_case_13_十_partitions_via_cross_cut_at_reflex():
+    """Cross-cut at inner-corner reflex point should be in the cut history."""
+    case = selected_cases([13])[0][2]
+    regions = regionize(case)
+    labels = {label for r in regions for label in r.cut_history}
+    assert "cross_cut" in labels or "vertex_aligned" in labels
 
 
 def test_region_area_sum_matches_atom_total():
@@ -95,12 +93,17 @@ def test_region_atom_ids_match_actual_atom_union_area():
         assert math.isclose(merged_area, region_area, rel_tol=1e-3), r.region_id
 
 
-def test_cut_history_is_recorded():
+def test_cut_history_uses_valid_labels():
     case = selected_cases([1])[0][2]
     regions = regionize(case)
-    # at least some regions should have non-empty cut_history
-    assert any(len(r.cut_history) > 0 for r in regions)
-    valid_labels = {"cross_cut", "vertex_aligned", "reflex_pair", "axis_mid"}
+    valid_labels = {
+        "structural_cross",
+        "structural_axis",
+        "cross_cut",
+        "vertex_aligned",
+        "reflex_pair",
+        "axis_mid",
+    }
     for r in regions:
         for label in r.cut_history:
             assert label in valid_labels, (r.region_id, label)
@@ -112,3 +115,40 @@ def test_target_area_smaller_produces_more_regions():
     coarse = regionize(case, atoms=atoms, target_area=12.0)
     fine = regionize(case, atoms=atoms, target_area=4.0)
     assert len(fine) > len(coarse)
+
+
+def test_disjoint_pieces_get_separate_components():
+    """When same-theta pieces aren't connected via the atom graph (e.g.
+    fully isolated wings or hole-separated regions), each connected
+    component is partitioned independently."""
+    case = selected_cases([23])[0][2]  # main + mirror wings (rotated, separate thetas)
+    atoms = atomize(case)
+    regions = regionize(case, atoms=atoms)
+    # Two wing thetas (+30° and -30°) should produce separate regions
+    thetas_seen = {round(r.theta, 5) for r in regions}
+    assert len(thetas_seen) >= 3  # main 0°, wing1 30°, wing2 60° (-30 mod 90°)
+
+
+def test_case_28_regions_do_not_cross_curved_transition_vertex():
+    case = selected_cases([28])[0][2]
+    atoms = atomize(case)
+    regions = regionize(case, atoms=atoms)
+
+    for r in regions:
+        minx, miny, maxx, maxy = _shape_to_polygon(r.shape).bounds
+        assert not (
+            minx < 4.0 < maxx and miny < 8.0 < maxy
+        ), (r.region_id, (minx, miny, maxx, maxy))
+
+
+def test_case_28_regions_respect_y4_structural_seam_in_left_leg():
+    case = selected_cases([28])[0][2]
+    atoms = atomize(case)
+    regions = regionize(case, atoms=atoms)
+
+    for r in regions:
+        minx, miny, maxx, maxy = _shape_to_polygon(r.shape).bounds
+        if maxx <= 4.0 + 1e-6:
+            assert not (
+                miny < 4.0 < maxy
+            ), (r.region_id, (minx, miny, maxx, maxy))

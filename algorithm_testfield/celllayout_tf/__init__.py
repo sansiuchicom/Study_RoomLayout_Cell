@@ -12,6 +12,7 @@ from .dimensions import (
     split_interval,
 )
 from .schema import ShapeInput, ShapePart, part_theta
+from .structural_guides import StructuralGuide, build_structural_guides
 from .territory import Territory, part_kind, resolve_territories
 from .viz import (
     save_atom_figure,
@@ -26,6 +27,8 @@ __all__ = [
     "ShapeInput",
     "ShapePart",
     "part_theta",
+    "StructuralGuide",
+    "build_structural_guides",
     "case_slug",
     "make_cases",
     "selected_cases",
